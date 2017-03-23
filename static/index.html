@@ -1,0 +1,72 @@
+<!doctype html>
+<form>
+  <input id=url value="https://google.com/">
+  <input type=submit>
+</form>
+
+<div id="container"></div>
+
+<br>
+Last error:
+<div id="err"></div>
+
+<style>
+.bundle {
+  background: #0f0;
+  margin: 2px;
+  width: 50px;
+  height: 50px;
+  font-size: 10px;
+  display: inline-block;
+}
+.bundle.bad {
+  background: red;
+}
+</style>
+
+<script>
+$ = document.querySelector.bind(document);
+$$ = document.querySelectorAll.bind(document);
+
+var sse;
+
+$('form').onsubmit = function(e) {
+  if (sse) {
+    sse.close();
+  }
+  sse = new EventSource('/boom?url=' + encodeURIComponent($('#url').value));
+  sse.onopen = function() {
+    console.log('sse opened');
+  };
+  sse.onerror = function() {
+    console.error('sse.onerror', this, arguments);
+    alert('EventSource error');
+  }
+  sse.onmessage = onmessage;
+  e.preventDefault();
+};
+
+function onmessage(msg) {
+  var bundle = JSON.parse(msg.data);
+  var square = document.createElement('div');
+  square.classList.add('bundle');
+  if (bundle.ErrText != '') {
+    $('#err').innerText = bundle.ErrText;
+  }
+  if (bundle.Bad == 0 && bundle.Err == 0) {
+    square.innerText = bundle.Good;
+  } else {
+    square.classList.add('bad');
+    square.innerText = [bundle.Good, bundle.Err, bundle.Bad].join(',');
+  }
+
+  square.innerText += '\n' + parseInt(bundle.Min / 1e6) + '-' + parseInt(bundle.Max / 1e6)
+
+  var container = $('#container');
+  container.prepend(square);
+  var maxSquares = 20;
+  if (container.children.length > maxSquares) {
+    container.removeChild(container.children[container.children.length - 1])
+  }
+}
+</script>
