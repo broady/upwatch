@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,8 +11,6 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/davecgh/go-spew/spew"
 
 	"golang.org/x/time/rate"
 )
@@ -47,69 +46,67 @@ type bundle struct {
 	ErrText string
 }
 
+func (b *bundle) add(r result) {
+	if r.err != nil {
+		b.Err++
+		b.ErrText = r.err.Error()
+	} else if r.code > 299 {
+		b.Bad++
+	} else {
+		b.Good++
+	}
+	if r.duration > b.Max {
+		b.Max = r.duration
+	}
+	if r.duration < b.Min {
+		b.Min = r.duration
+	}
+}
+
+func semaphore(n int) chan bool {
+	ch := make(chan bool, n)
+	for i := 0; i < n; i++ {
+		ch <- true
+	}
+	return ch
+}
+
 func boom(w http.ResponseWriter, r *http.Request) {
+	wf, ok := w.(WriteFlusher)
+	if !ok {
+		http.Error(w, "ResponseWriter is not a Flusher", 500)
+		return
+	}
 	url := r.FormValue("url")
 	if url == "" {
 		http.Error(w, "Missing URL", http.StatusMethodNotAllowed)
 		return
 	}
-
-	f, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "ResponseWriter is not a Flusher", 500)
+	log.Printf("GET %q", url)
+	if _, err := http.NewRequest("GET", url, nil); err != nil {
+		http.Error(w, "Invalid URL", http.StatusBadRequest)
 		return
 	}
 
+	// NOTE: ctx is cancelled when the client goes away.
 	ctx := r.Context()
-	const qps = 200
-	const concurrency = 50
-	rate := rate.NewLimiter(rate.Every(time.Second/qps), 1)
-	sem := make(chan bool, concurrency)
-	for i := 0; i < cap(sem); i++ {
-		sem <- true
-	}
-	results := make(chan result, 10000)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 
-	log.Printf("GET %q", url)
+	results := make(chan result, 10000)
 
-	_, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		log.Printf("NewRequest: %v", err)
-		return
-	}
-
-	tick := time.Tick(time.Second)
+	// Write bundles to event stream.
 	go func() {
-		b := bundle{Min: time.Duration(1<<63 - 1)}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case r := <-results:
-				if r.err != nil {
-					b.Err++
-					b.ErrText = spew.Sdump(r.err)
-				} else if r.code > 299 {
-					b.Bad++
-				} else {
-					b.Good++
-				}
-				if r.duration > b.Max {
-					b.Max = r.duration
-				}
-				if r.duration < b.Min {
-					b.Min = r.duration
-				}
-			case <-tick:
-				j, _ := json.Marshal(b)
-				writeData(w, j)
-				f.Flush()
-				b = bundle{Min: time.Duration(1<<63 - 1)}
-			}
+		for b := range bundleResults(ctx, results, time.Second) {
+			j, _ := json.Marshal(b)
+			writeSSE(wf, j)
 		}
 	}()
+
+	const qps = 200
+	const concurrency = 50
+	rate := rate.NewLimiter(rate.Every(time.Second/qps), 1)
+	sem := semaphore(concurrency)
 
 	for {
 		if err := rate.Wait(ctx); err != nil {
@@ -119,8 +116,7 @@ func boom(w http.ResponseWriter, r *http.Request) {
 		<-sem
 		go func() {
 			start := time.Now()
-			req, _ := http.NewRequest("GET", url, nil)
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := http.Get(url)
 			if err != nil {
 				r := result{err: err, duration: time.Now().Sub(start)}
 				sem <- true
@@ -136,12 +132,44 @@ func boom(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeData(w io.Writer, data []byte) {
+type WriteFlusher interface {
+	io.Writer
+	http.Flusher
+}
+
+func writeSSE(wf WriteFlusher, data []byte) {
 	bb := bytes.Split(data, []byte("\n"))
 	for _, b := range bb {
-		w.Write([]byte("data: "))
-		w.Write(b)
-		w.Write([]byte("\n"))
+		wf.Write([]byte("data: "))
+		wf.Write(b)
+		wf.Write([]byte("\n"))
 	}
-	w.Write([]byte("\n"))
+	wf.Write([]byte("\n"))
+	wf.Flush()
+}
+
+func bundleResults(ctx context.Context, results chan result, d time.Duration) chan bundle {
+	bundles := make(chan bundle, 1)
+	tick := time.NewTicker(time.Second)
+
+	go func() {
+		b := bundle{Min: time.Duration(1<<63 - 1)}
+		for {
+			select {
+			case <-ctx.Done():
+				close(bundles)
+				tick.Stop()
+				return
+
+			case <-tick.C:
+				bundles <- b
+				b = bundle{Min: time.Duration(1<<63 - 1)}
+
+			case r := <-results:
+				b.add(r)
+			}
+		}
+	}()
+
+	return bundles
 }
