@@ -53,14 +53,16 @@ function onmessage(msg) {
   if (bundle.ErrText != '') {
     $('#err').innerText = bundle.ErrText;
   }
-  if (bundle.Bad == 0 && bundle.Err == 0) {
-    square.innerText = bundle.Good;
+  if (bundle.Bad == 0 && bundle.Err == 0 && bundle.Good != 0) {
+    square.innerText = 'n:' + bundle.Good;
   } else {
     square.classList.add('bad');
     square.innerText = [bundle.Good, bundle.Err, bundle.Bad].join(',');
   }
 
-  square.innerText += '\n' + parseInt(bundle.Min / 1e6) + '-' + parseInt(bundle.Max / 1e6)
+  if ((bundle.Bad + bundle.Err + bundle.Good) != 0) {
+    square.innerText += '\nt:' + parseInt(bundle.Min / 1e6) + '-' + parseInt(bundle.Max / 1e6)
+  }
 
   var container = $('#container');
   container.prepend(square);
